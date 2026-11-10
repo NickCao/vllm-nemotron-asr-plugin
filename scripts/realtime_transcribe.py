@@ -201,8 +201,21 @@ def main() -> None:
     )
     parser.add_argument("--url", default="ws://127.0.0.1:8000/v1/realtime")
     parser.add_argument("--model", default="nemotron")
-    parser.add_argument("--chunk-ms", type=int, default=250)
-    parser.add_argument("--start-after-ms", type=int, default=500)
+    parser.add_argument(
+        "--chunk-ms",
+        type=int,
+        default=40,
+        help="Audio packet size in milliseconds (default: 40)",
+    )
+    parser.add_argument(
+        "--start-after-ms",
+        type=int,
+        default=0,
+        help=(
+            "Buffered milliseconds before the first commit (default: 0, which "
+            "lets the server start as soon as its first audio chunk is ready)"
+        ),
+    )
     parser.add_argument(
         "--pace",
         action=argparse.BooleanOptionalAction,

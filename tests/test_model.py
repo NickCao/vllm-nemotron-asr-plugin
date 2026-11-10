@@ -331,7 +331,7 @@ def test_iter_realtime_chunks_pads_short_single_chunk() -> None:
     assert output[0][1:] == (True, True)
 
 
-def test_iter_realtime_chunks_marks_exact_multiple_last_without_padding() -> None:
+def test_iter_realtime_chunks_emits_exact_multiple_without_lookahead() -> None:
     output = _collect_realtime_chunks(
         [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]],
         first_chunk_samples=4,
@@ -342,10 +342,13 @@ def test_iter_realtime_chunks_marks_exact_multiple_last_without_padding() -> Non
     np.testing.assert_array_equal(output[0][0], [1, 2, 3, 4])
     np.testing.assert_array_equal(output[1][0], [5, 6, 7, 8])
     np.testing.assert_array_equal(output[2][0], [9, 10, 11, 12])
+    # Chunks are forwarded as soon as they are complete, so a stream that ends
+    # exactly on a chunk boundary never learns it was final. The tail this
+    # costs is the last mel-frame pad, which is a few milliseconds of audio.
     assert [item[1:] for item in output] == [
         (True, False),
         (False, False),
-        (False, True),
+        (False, False),
     ]
 
 

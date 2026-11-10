@@ -182,8 +182,10 @@ async def iter_realtime_chunks(
 ) -> AsyncGenerator[tuple[np.ndarray, bool, bool], None]:
     """Split a live audio stream into cache-aware encoder chunks.
 
-    Yields ``(audio, is_first_audio_chunk, is_last_audio_chunk)``. One chunk of
-    lookahead is held back so the true final chunk can be marked as last.
+    Yields ``(audio, is_first_audio_chunk, is_last_audio_chunk)``. A chunk is
+    emitted as soon as it is complete so the engine can start on it without
+    waiting for the next chunk; only the trailing partial chunk is padded and
+    marked as last.
     """
     buffer = Nemotron3_5AsrRealtimeBuffer()
     audio_queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
@@ -208,7 +210,6 @@ async def iter_realtime_chunks(
     fill_task = asyncio.create_task(fill_audio_buffer())
     try:
         is_first_audio_chunk = True
-        pending: tuple[np.ndarray, bool] | None = None
         while True:
             required_samples = (
                 first_chunk_samples
@@ -218,16 +219,11 @@ async def iter_realtime_chunks(
             chunk = await read_chunk(required_samples)
             if chunk is None:
                 break
-            if pending is not None:
-                yield pending[0], pending[1], False
-            pending = (chunk, is_first_audio_chunk)
+            yield chunk, is_first_audio_chunk, False
             is_first_audio_chunk = False
 
         remaining = buffer.flush()
         if remaining is not None:
-            if pending is not None:
-                yield pending[0], pending[1], False
-                pending = None
             required_samples = (
                 first_chunk_samples
                 if is_first_audio_chunk
@@ -239,8 +235,6 @@ async def iter_realtime_chunks(
                     (0, required_samples - remaining.size),
                 )
             yield remaining, is_first_audio_chunk, True
-        elif pending is not None:
-            yield pending[0], pending[1], True
     finally:
         fill_task.cancel()
         with suppress(asyncio.CancelledError):
