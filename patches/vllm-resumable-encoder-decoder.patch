@@ -1,0 +1,16 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2076,8 +2076,12 @@
+             item_identifier = mm_feature.identifier
+ 
+-            if self.is_encoder_decoder and num_computed_tokens > 0:
++            if (
++                self.is_encoder_decoder
++                and num_computed_tokens > 0
++                and not request.resumable
++            ):
+                 assert start_pos == 0, (
+                     "Encoder input should be processed at the beginning of "
+                     "the sequence when encoder-decoder models are used."
+                 )
+                 # Encoder input has already been computed

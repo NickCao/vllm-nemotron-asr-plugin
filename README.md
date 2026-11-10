@@ -1,10 +1,10 @@
 # Nemotron 3.5 ASR Plugin for vLLM
 
-Out-of-tree vLLM model plugin for complete-audio transcription with [`nvidia/nemotron-3.5-asr-streaming-0.6b`](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b).
+Out-of-tree vLLM model plugin for complete-audio and cache-aware realtime transcription with [`nvidia/nemotron-3.5-asr-streaming-0.6b`](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b).
 
 The plugin integrates `Nemotron3_5AsrForRNNT` with vLLM using batched greedy RNN-T decoding and the standard OpenAI-compatible `/v1/audio/transcriptions` endpoint.
 
-> Despite the checkpoint name containing `streaming`, this plugin currently supports **complete-audio transcription only**. Native cache-aware realtime streaming is not supported.
+Realtime transcription runs one resumable vLLM request per WebSocket session and streams transcript deltas over `/v1/realtime`. It requires Model Runner V2, eager execution, CUDA, TP=PP=1, and the core scheduler patch described in [`patches/README.md`](patches/README.md) until equivalent support lands upstream.
 
 ## Installation
 
@@ -108,6 +108,23 @@ HF_HUB_OFFLINE=1 VLLM_USE_V2_MODEL_RUNNER=1 \
 vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b --enforce-eager
 ```
 
+### Realtime streaming
+
+Stream from the default microphone through the OpenAI-compatible WebSocket
+endpoint:
+
+```bash
+uv pip install -e '.[mic]'
+python scripts/realtime_transcribe.py \
+    --url ws://127.0.0.1:8000/v1/realtime \
+    --model nemotron
+```
+
+Transcript deltas are printed as they arrive; press Ctrl+C to commit the
+stream and exit. Passing a 16 kHz mono WAV file streams that file instead.
+See [`scripts/README.md`](scripts/README.md) for device selection and pacing
+options.
+
 ## Tests
 
 Install test dependencies:
@@ -166,6 +183,7 @@ See [`scripts/README.md`](scripts/README.md) for evaluation details.
 
 - `nvidia/nemotron-3.5-asr-streaming-0.6b`
 - complete-audio transcription
+- cache-aware realtime transcription over `/v1/realtime`
 - Model Runner V2
 - eager execution
 - CUDA
@@ -173,6 +191,7 @@ See [`scripts/README.md`](scripts/README.md) for evaluation details.
 - PP=1
 - one audio item per request
 - batched independent requests
+- concurrent realtime sessions with isolated RNN-T state
 - greedy RNN-T decoding
 - replay after preemption
 - OpenAI-compatible `/v1/audio/transcriptions`
@@ -181,7 +200,6 @@ See [`scripts/README.md`](scripts/README.md) for evaluation details.
 
 The following are currently unsupported:
 
-- native cache-aware realtime streaming
 - beam search
 - speculative decoding
 - quantization
@@ -190,6 +208,9 @@ The following are currently unsupported:
 - text prompts and hotwords
 - structured outputs
 - confidence scoring
+
+Realtime session recovery across preemption or worker restarts is still
+pilot-grade and should not be relied on in production.
 
 Selected-token logprobs exposed by the current implementation are synthetic and are not model probabilities.
 

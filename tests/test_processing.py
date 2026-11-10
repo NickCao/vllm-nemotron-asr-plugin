@@ -15,6 +15,7 @@ from vllm_nemotron_asr_plugin.processing import (
     Nemotron3_5AsrDummyInputsBuilder,
     Nemotron3_5AsrMultiModalProcessor,
     NemotronAsrStreamingFeatureExtractor,
+    _get_streaming_subsampling_output_lengths,
     _get_subsampling_output_lengths,
 )
 
@@ -139,7 +140,7 @@ def test_nemotron_dummy_audio_is_bounded(
     [
         (159, {}, "audio samples"),
         (4000, {}, "audio samples"),
-        (1600, {"is_streaming": True}, "complete audio clip"),
+        (1600, {"is_streaming": True}, "streaming chunks must contain exactly"),
         (
             1600,
             {"audio_kwargs": {"padding": "max_length", "max_length": 4800}},
@@ -183,3 +184,20 @@ def test_nemotron_feature_extractor_matches_transformers() -> None:
         rtol=1e-5,
         atol=1e-6,
     )
+
+
+@pytest.mark.parametrize(
+    ("num_mel_frames", "expected_frames"),
+    [(26, 4), (32, 4), (105, 14), (106, 14), (112, 14)],
+)
+def test_streaming_subsampling_output_lengths(
+    num_mel_frames: int,
+    expected_frames: int,
+) -> None:
+    output_lengths = _get_streaming_subsampling_output_lengths(
+        torch.tensor([num_mel_frames]),
+        subsampling_factor=8,
+        subsampling_conv_kernel_size=3,
+        subsampling_conv_stride=2,
+    )
+    assert output_lengths.item() == expected_frames

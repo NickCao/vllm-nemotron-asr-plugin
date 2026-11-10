@@ -131,13 +131,10 @@ class NemotronAsrStreamingFeatureExtractor(SequenceFeatureExtractor):
         sampling_rate: int | None = None,
         device: str | torch.device = "cpu",
         center: bool = True,
+        is_last_audio_chunk: bool = False,
         **kwargs,
     ) -> BatchFeature:
         del return_attention_mask, kwargs
-        if not center:
-            raise ValueError(
-                "Nemotron 3.5 ASR feature extraction requires center=True."
-            )
         if sampling_rate is not None and sampling_rate != self.sampling_rate:
             raise ValueError(
                 f"Expected sampling rate {self.sampling_rate}, got {sampling_rate}."
@@ -199,17 +196,33 @@ class NemotronAsrStreamingFeatureExtractor(SequenceFeatureExtractor):
             )
             padded = padded.masked_fill(~time_mask, 0.0)
 
+        if is_last_audio_chunk and not center:
+            # Match the final frame of a centered full-utterance pass.
+            num_padding = self.n_fft // 2 - self.hop_length
+            padded = torch.nn.functional.pad(padded, (0, num_padding))
+            lengths = lengths + num_padding
+
         extract_device = torch.device(device)
         input_features = self._torch_extract_fbank_features(
             padded,
             device=extract_device,
-            center=True,
+            center=center,
         )
-        feature_lengths = torch.div(
-            lengths,
-            self.hop_length,
-            rounding_mode="floor",
-        )
+        if center:
+            feature_lengths = torch.div(
+                lengths,
+                self.hop_length,
+                rounding_mode="floor",
+            )
+        else:
+            feature_lengths = (
+                torch.div(
+                    lengths - self.n_fft,
+                    self.hop_length,
+                    rounding_mode="floor",
+                )
+                + 1
+            )
         attention_mask = (
             torch.arange(input_features.shape[1], device=extract_device)[None, :]
             < feature_lengths.to(extract_device)[:, None]
@@ -241,6 +254,37 @@ def _get_subsampling_output_lengths(
         output_lengths = (
             torch.div(
                 output_lengths + add_pad,
+                subsampling_conv_stride,
+                rounding_mode="floor",
+            )
+            + 1
+        )
+
+    return output_lengths
+
+
+def _get_streaming_subsampling_output_lengths(
+    input_lengths: torch.Tensor,
+    *,
+    subsampling_factor: int,
+    subsampling_conv_kernel_size: int,
+    subsampling_conv_stride: int,
+) -> torch.Tensor:
+    """Encoder frame counts for cache-aware streaming chunks.
+
+    On the first streaming call, each strided conv initializes its padding
+    cache with ``kernel_size - 1`` zero frames.  Later calls prepend the same
+    amount of cached left context, so every layer maps ``length`` to
+    ``(length - 1) // stride + 1``.
+    """
+    num_layers = int(math.log2(subsampling_factor))
+    left_pad = subsampling_conv_kernel_size - 1
+
+    output_lengths = input_lengths
+    for _ in range(num_layers):
+        output_lengths = (
+            torch.div(
+                output_lengths + left_pad - subsampling_conv_kernel_size,
                 subsampling_conv_stride,
                 rounding_mode="floor",
             )
@@ -390,12 +434,12 @@ class Nemotron3_5AsrMultiModalProcessor(
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> HFMultiModalInputs:
-        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_processor_mm_kwargs)
-        if hf_processor_mm_kwargs.get("is_streaming"):
-            raise ValueError(
-                "Nemotron 3.5 ASR requires a complete audio clip per request."
-            )
+        is_streaming = bool(hf_processor_mm_kwargs.get("is_streaming", False))
+        is_first_audio_chunk = bool(
+            hf_processor_mm_kwargs.get("is_first_audio_chunk", True)
+        )
         feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
+        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
 
         max_samples = self.info.get_max_audio_samples()
         audio_kwargs = cast(
@@ -411,9 +455,21 @@ class Nemotron3_5AsrMultiModalProcessor(
                 )
         audios = mm_items.get_items("audio", AudioProcessorItems)
         for index in range(len(audios)):
+            audio_length = audios.get_audio_length(index)
+            if is_streaming:
+                expected_length = (
+                    processor.num_samples_first_audio_chunk
+                    if is_first_audio_chunk
+                    else processor.num_samples_per_audio_chunk
+                )
+                if audio_length != expected_length:
+                    raise ValueError(
+                        "Nemotron 3.5 ASR streaming chunks must contain exactly "
+                        f"{expected_length} audio samples, got {audio_length}."
+                    )
             if (
                 not feature_extractor.hop_length
-                <= audios.get_audio_length(index)
+                <= audio_length
                 <= max_samples
             ):
                 raise ValueError(
@@ -426,7 +482,25 @@ class Nemotron3_5AsrMultiModalProcessor(
             "sampling_rate", feature_extractor.sampling_rate
         )
 
+        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_processor_mm_kwargs)
         return hf_inputs._replace(hf_kwargs=hf_processor_mm_kwargs)
+
+    def _postprocess_hf_mm_data(
+        self,
+        mm_inputs: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+        processed_data: BatchFeature,
+    ) -> BatchFeature:
+        del mm_inputs
+        processed_data["is_streaming"] = torch.tensor(
+            [bool(hf_processor_mm_kwargs.get("is_streaming", False))],
+            dtype=torch.bool,
+        )
+        processed_data["is_first_audio_chunk"] = torch.tensor(
+            [bool(hf_processor_mm_kwargs.get("is_first_audio_chunk", True))],
+            dtype=torch.bool,
+        )
+        return processed_data
 
     def _get_mm_fields_config(
         self,
@@ -448,6 +522,12 @@ class Nemotron3_5AsrMultiModalProcessor(
             "num_lookahead_tokens": MultiModalFieldConfig.shared(
                 "audio", num_audios, keep_on_cpu=True
             ),
+            "is_streaming": MultiModalFieldConfig.shared(
+                "audio", num_audios, keep_on_cpu=True
+            ),
+            "is_first_audio_chunk": MultiModalFieldConfig.shared(
+                "audio", num_audios, keep_on_cpu=True
+            ),
         }
 
     def _get_prompt_updates(
@@ -456,16 +536,29 @@ class Nemotron3_5AsrMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
-        attention_mask = out_mm_kwargs.get_data()["attention_mask"]
-        assert isinstance(attention_mask, torch.Tensor)
-
         encoder_config = self.info.get_hf_config().encoder_config
-        output_lengths = _get_subsampling_output_lengths(
-            attention_mask.sum(-1),
-            subsampling_factor=encoder_config.subsampling_factor,
-            subsampling_conv_kernel_size=encoder_config.subsampling_conv_kernel_size,
-            subsampling_conv_stride=encoder_config.subsampling_conv_stride,
-        ).tolist()
+        if hf_processor_mm_kwargs.get("is_streaming"):
+            input_features = out_mm_kwargs.get_data()["input_features"]
+            assert isinstance(input_features, torch.Tensor)
+            output_lengths = _get_streaming_subsampling_output_lengths(
+                torch.full(
+                    (input_features.shape[0],),
+                    input_features.shape[1],
+                    dtype=torch.long,
+                ),
+                subsampling_factor=encoder_config.subsampling_factor,
+                subsampling_conv_kernel_size=encoder_config.subsampling_conv_kernel_size,
+                subsampling_conv_stride=encoder_config.subsampling_conv_stride,
+            ).tolist()
+        else:
+            attention_mask = out_mm_kwargs.get_data()["attention_mask"]
+            assert isinstance(attention_mask, torch.Tensor)
+            output_lengths = _get_subsampling_output_lengths(
+                attention_mask.sum(-1),
+                subsampling_factor=encoder_config.subsampling_factor,
+                subsampling_conv_kernel_size=encoder_config.subsampling_conv_kernel_size,
+                subsampling_conv_stride=encoder_config.subsampling_conv_stride,
+            ).tolist()
 
         def replacement(item_idx: int) -> list[int]:
             return [0] * output_lengths[item_idx]

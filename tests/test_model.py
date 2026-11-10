@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from transformers import (
@@ -27,10 +29,16 @@ from vllm_nemotron_asr_plugin.config import Nemotron3_5AsrForRNNTConfig
 from vllm_nemotron_asr_plugin.model import (
     Nemotron3_5AsrDecodeState,
     Nemotron3_5AsrForRNNT,
+    Nemotron3_5AsrRealtimeBuffer,
     _decode_next_tokens,
+    iter_realtime_chunks,
 )
 from vllm_nemotron_asr_plugin.model_state import (
     Nemotron3_5AsrModelState,
+    Nemotron3_5AsrStreamingState,
+)
+from vllm_nemotron_asr_plugin.processing import (
+    _get_streaming_subsampling_output_lengths,
 )
 
 
@@ -228,6 +236,199 @@ def test_nemotron_audio_encoder_preserves_batch_and_valid_lengths(
         torch.testing.assert_close(unpadded[row], batched[row])
 
 
+@pytest.mark.parametrize("num_mel_frames", [26, 32, 106, 112])
+def test_streaming_subsampling_lengths_match_encoder(
+    num_mel_frames: int,
+) -> None:
+    config = _get_tiny_config()
+    model = Nemotron3_5AsrForRNNT(vllm_config=_get_vllm_config(config)).eval()
+    encoder_config = config.encoder_config
+
+    with torch.inference_mode():
+        frames, _, _ = model.audio_encoder.forward_streaming_chunk(
+            torch.randn(1, num_mel_frames, encoder_config.num_mel_bins),
+            torch.tensor([2]),
+            encoder_config.default_num_lookahead_tokens,
+        )
+
+    expected = _get_streaming_subsampling_output_lengths(
+        torch.tensor([num_mel_frames]),
+        subsampling_factor=encoder_config.subsampling_factor,
+        subsampling_conv_kernel_size=encoder_config.subsampling_conv_kernel_size,
+        subsampling_conv_stride=encoder_config.subsampling_conv_stride,
+    )
+    assert frames.shape[1] == expected.item()
+
+
+def test_realtime_buffer_emits_exact_chunks_and_flushes_remainder() -> None:
+    buffer = Nemotron3_5AsrRealtimeBuffer(initial_capacity=4)
+    buffer.write(np.arange(10, dtype=np.float32))
+
+    np.testing.assert_array_equal(
+        buffer.read(4),
+        np.arange(4, dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        buffer.read(4),
+        np.arange(4, 8, dtype=np.float32),
+    )
+    assert buffer.read(4) is None
+    np.testing.assert_array_equal(
+        buffer.flush(),
+        np.arange(8, 10, dtype=np.float32),
+    )
+    assert buffer.flush() is None
+
+
+def _collect_realtime_chunks(
+    chunks: list[list[float]],
+    *,
+    first_chunk_samples: int,
+    subsequent_chunk_samples: int,
+) -> list[tuple[np.ndarray, bool, bool]]:
+    async def audio_stream():
+        for chunk in chunks:
+            yield np.asarray(chunk, dtype=np.float32)
+
+    async def collect():
+        return [
+            item
+            async for item in iter_realtime_chunks(
+                audio_stream(),
+                first_chunk_samples=first_chunk_samples,
+                subsequent_chunk_samples=subsequent_chunk_samples,
+            )
+        ]
+
+    return asyncio.run(collect())
+
+
+def test_iter_realtime_chunks_consumes_stream_and_marks_final_chunk() -> None:
+    output = _collect_realtime_chunks(
+        [[1, 2], [3, 4, 5], [6, 7], [8, 9, 10, 11]],
+        first_chunk_samples=4,
+        subsequent_chunk_samples=4,
+    )
+
+    assert len(output) == 3
+    np.testing.assert_array_equal(output[0][0], [1, 2, 3, 4])
+    assert output[0][1:] == (True, False)
+    np.testing.assert_array_equal(output[1][0], [5, 6, 7, 8])
+    assert output[1][1:] == (False, False)
+    np.testing.assert_array_equal(output[2][0], [9, 10, 11, 0])
+    assert output[2][1:] == (False, True)
+
+
+def test_iter_realtime_chunks_pads_short_single_chunk() -> None:
+    output = _collect_realtime_chunks(
+        [[1, 2]],
+        first_chunk_samples=4,
+        subsequent_chunk_samples=4,
+    )
+
+    assert len(output) == 1
+    np.testing.assert_array_equal(output[0][0], [1, 2, 0, 0])
+    assert output[0][1:] == (True, True)
+
+
+def test_iter_realtime_chunks_marks_exact_multiple_last_without_padding() -> None:
+    output = _collect_realtime_chunks(
+        [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]],
+        first_chunk_samples=4,
+        subsequent_chunk_samples=4,
+    )
+
+    assert len(output) == 3
+    np.testing.assert_array_equal(output[0][0], [1, 2, 3, 4])
+    np.testing.assert_array_equal(output[1][0], [5, 6, 7, 8])
+    np.testing.assert_array_equal(output[2][0], [9, 10, 11, 12])
+    assert [item[1:] for item in output] == [
+        (True, False),
+        (False, False),
+        (False, True),
+    ]
+
+
+def test_streaming_frame_buffer_grows_and_compacts_pending_frames() -> None:
+    config = _get_tiny_config()
+    model = Nemotron3_5AsrForRNNT(vllm_config=_get_vllm_config(config)).eval()
+    state = Nemotron3_5AsrStreamingState(
+        model,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    initial_capacity = state.frame_capacity
+    first = torch.arange(
+        3 * initial_capacity,
+        dtype=torch.float32,
+    ).reshape(3 * initial_capacity, 1)
+
+    Nemotron3_5AsrModelState._append_streaming_frames(state, first)
+
+    assert state.frame_capacity >= first.shape[0]
+    torch.testing.assert_close(state.decode_state.encoder_frames, first)
+
+    state.decode_state.frame_idx = 2
+    second = torch.full((5, 1), -1.0)
+    Nemotron3_5AsrModelState._append_streaming_frames(state, second)
+
+    expected = torch.cat((first[2:], second))
+    torch.testing.assert_close(state.decode_state.encoder_frames, expected)
+    assert state.decode_state.frame_idx == 0
+
+
+def _streaming_feature(is_streaming: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        modality="audio",
+        identifier="streaming-audio",
+        data={
+            "is_streaming": SimpleNamespace(
+                data=torch.tensor([is_streaming], dtype=torch.bool)
+            )
+        },
+    )
+
+
+def test_streaming_state_survives_worker_remove_and_readd() -> None:
+    config = _get_tiny_config()
+    model = Nemotron3_5AsrForRNNT(vllm_config=_get_vllm_config(config)).eval()
+    state = Nemotron3_5AsrModelState.__new__(Nemotron3_5AsrModelState)
+    state.model = model
+    state.dtype = torch.float32
+    state.device = torch.device("cpu")
+    state.audio_hashes = {}
+    state.request_indices = {}
+    state.decode_states = {}
+    state.num_tokens_to_replay = {}
+    state.streaming_states = {}
+    state.pending_streaming_states = {}
+    feature = _streaming_feature(True)
+
+    state.add_request(
+        0,
+        SimpleNamespace(req_id="stream", mm_features=[feature]),
+    )
+    session_state = state.streaming_states["stream"]
+    session_state.encoded_features = 1
+
+    state.remove_request("stream")
+    assert "stream" not in state.streaming_states
+    assert state.pending_streaming_states["stream"] is session_state
+
+    state.add_request(
+        1,
+        SimpleNamespace(req_id="stream", mm_features=[feature, feature]),
+    )
+
+    assert state.streaming_states["stream"] is session_state
+    assert session_state.num_features == 2
+    assert session_state.encoded_features == 1
+    assert state.request_indices["stream"] == 1
+
+    state.apply_staged_writes()
+    assert not state.pending_streaming_states
+
+
 class _ScriptedJoint(torch.nn.Module):
     def __init__(self, token_ids: list[list[int]], vocab_size: int):
         super().__init__()
@@ -325,6 +526,7 @@ def test_nemotron_eager_dummy_prepare_profiles_decoder_without_live_mutation() -
     state.device = torch.device("cpu")
     state.dtype = torch.float32
     state.request_indices = {"live": 0}
+    state.pending_streaming_states = {}
     live_state = Nemotron3_5AsrDecodeState(
         encoder_frames=torch.zeros(1, config.decoder_hidden_size),
         decoder_cache=Nemotron3_5AsrRNNTDecoderCache(config),

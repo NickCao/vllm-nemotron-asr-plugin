@@ -22,6 +22,53 @@ from vllm.v1.worker.utils import AttentionGroup
 from .model import Nemotron3_5AsrDecodeState
 
 
+class Nemotron3_5AsrStreamingState:
+    """Caches and pending acoustic frames for one realtime session."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        config = model.config
+        lookahead = int(
+            getattr(config.encoder_config, "default_num_lookahead_tokens", 13)
+        )
+        self.frame_capacity = max(2 * (lookahead + 2), 4)
+        self.frame_buffer = torch.empty(
+            (self.frame_capacity, config.decoder_hidden_size),
+            dtype=dtype,
+            device=device,
+        )
+        self.decode_state = Nemotron3_5AsrDecodeState(
+            encoder_frames=self.frame_buffer[:0],
+            decoder_cache=Nemotron3_5AsrRNNTDecoderCache(config),
+            last_token_id=config.blank_token_id,
+        )
+        self.past_key_values: object | None = None
+        self.padding_cache: object | None = None
+        self.encoded_features = 0
+        self.num_features = 0
+
+
+def _get_mm_scalar(feature: object, key: str) -> object | None:
+    data = getattr(feature, "data", None)
+    if data is None:
+        return None
+    elem = data.get(key)
+    if elem is None:
+        return None
+    value = elem.data
+    if isinstance(value, torch.Tensor):
+        return value.reshape(-1)[0].item()
+    return value
+
+
+def _feature_is_streaming(feature: object) -> bool:
+    return bool(_get_mm_scalar(feature, "is_streaming") or False)
+
+
 class Nemotron3_5AsrModelState(ModelState):
     """Keep RNNT acoustic and LSTM state isolated per request."""
 
@@ -50,6 +97,8 @@ class Nemotron3_5AsrModelState(ModelState):
         self.request_indices: dict[str, int] = {}
         self.decode_states: dict[str, Nemotron3_5AsrDecodeState] = {}
         self.num_tokens_to_replay: dict[str, int] = {}
+        self.streaming_states: dict[str, Nemotron3_5AsrStreamingState] = {}
+        self.pending_streaming_states: dict[str, Nemotron3_5AsrStreamingState] = {}
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         audio_features = [
@@ -59,6 +108,26 @@ class Nemotron3_5AsrModelState(ModelState):
         ]
         if not audio_features and new_req_data.req_id.startswith("_warmup_"):
             return
+
+        if audio_features and _feature_is_streaming(audio_features[-1]):
+            req_id = new_req_data.req_id
+            state = self.pending_streaming_states.pop(req_id, None)
+            if state is None:
+                state = self.streaming_states.get(req_id)
+            if state is None:
+                state = Nemotron3_5AsrStreamingState(
+                    self.model,
+                    self.dtype,
+                    self.device,
+                )
+            state.num_features = len(audio_features)
+            self.streaming_states[req_id] = state
+            self.request_indices[req_id] = req_index
+            self.audio_hashes.pop(req_id, None)
+            self.decode_states.pop(req_id, None)
+            self.num_tokens_to_replay.pop(req_id, None)
+            return
+
         if len(audio_features) != 1:
             raise ValueError("Nemotron 3.5 ASR expects one audio per request.")
         self.audio_hashes[new_req_data.req_id] = audio_features[0].identifier
@@ -69,10 +138,15 @@ class Nemotron3_5AsrModelState(ModelState):
         )
 
     def remove_request(self, req_id: str) -> None:
+        if state := self.streaming_states.pop(req_id, None):
+            self.pending_streaming_states[req_id] = state
         self.audio_hashes.pop(req_id, None)
         self.request_indices.pop(req_id, None)
         self.decode_states.pop(req_id, None)
         self.num_tokens_to_replay.pop(req_id, None)
+
+    def apply_staged_writes(self) -> None:
+        self.pending_streaming_states.clear()
 
     def prepare_inputs_embeds(
         self,
@@ -80,12 +154,92 @@ class Nemotron3_5AsrModelState(ModelState):
         input_batch: InputBatch,
         req_states: RequestState,
     ) -> None:
-        self.execute_mm_encoder(scheduled_encoder_inputs)
+        non_streaming_encoder_inputs = {
+            req_id: input_ids
+            for req_id, input_ids in scheduled_encoder_inputs.items()
+            if req_id not in self.streaming_states
+        }
+        if non_streaming_encoder_inputs:
+            self.execute_mm_encoder(non_streaming_encoder_inputs)
+
+        for req_id in input_batch.req_ids:
+            state = self.streaming_states.get(req_id)
+            while state is not None and state.encoded_features < state.num_features:
+                self._encode_next_streaming_feature(req_id, state)
         return None
+
+    def _encode_next_streaming_feature(
+        self,
+        req_id: str,
+        state: Nemotron3_5AsrStreamingState,
+    ) -> None:
+        features = self.encoder_cache.mm_features.get(req_id, [])
+        if state.encoded_features >= len(features):
+            raise RuntimeError(
+                f"Missing streaming audio features for request {req_id}."
+            )
+
+        feature = features[state.encoded_features]
+        if feature.data is None:
+            raise RuntimeError(
+                f"Streaming audio feature {state.encoded_features} for "
+                f"request {req_id} is no longer available."
+            )
+        input_features = feature.data["input_features"].data
+        prompt_ids = feature.data["prompt_ids"].data
+        lookahead = feature.data["num_lookahead_tokens"].data
+        assert isinstance(input_features, torch.Tensor)
+        if input_features.ndim == 2:
+            input_features = input_features.unsqueeze(0)
+        if isinstance(prompt_ids, torch.Tensor):
+            prompt_ids = prompt_ids.reshape(-1)[:1]
+        if isinstance(lookahead, torch.Tensor):
+            lookahead = int(lookahead.reshape(-1)[0].item())
+
+        frames, past_key_values, padding_cache = (
+            self.model.audio_encoder.forward_streaming_chunk(
+                input_features.to(device=self.device, dtype=self.dtype),
+                prompt_ids,
+                int(lookahead),
+                past_key_values=state.past_key_values,
+                padding_cache=state.padding_cache,
+            )
+        )
+        self._append_streaming_frames(state, frames[0])
+        state.past_key_values = past_key_values
+        state.padding_cache = padding_cache
+        state.encoded_features += 1
+
+    @staticmethod
+    def _append_streaming_frames(
+        state: Nemotron3_5AsrStreamingState,
+        frames: torch.Tensor,
+    ) -> None:
+        decode_state = state.decode_state
+        pending = decode_state.encoder_frames.shape[0] - decode_state.frame_idx
+        pending_frames = (
+            decode_state.encoder_frames[decode_state.frame_idx :].clone()
+            if pending
+            else None
+        )
+        end = pending + frames.shape[0]
+        if end > state.frame_capacity:
+            state.frame_capacity = max(end, state.frame_capacity * 2)
+            state.frame_buffer = torch.empty(
+                (state.frame_capacity, frames.shape[1]),
+                dtype=frames.dtype,
+                device=frames.device,
+            )
+        if pending_frames is not None:
+            state.frame_buffer[:pending].copy_(pending_frames)
+        state.frame_buffer[pending:end].copy_(frames)
+        decode_state.encoder_frames = state.frame_buffer[:end]
+        decode_state.frame_idx = 0
 
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, Any]:
+        self.pending_streaming_states.clear()
         # Eager dummy runs use synthetic request IDs and mark every token as
         # padding. Profile the RNNT path without touching live request state.
         if not any(
@@ -101,6 +255,11 @@ class Nemotron3_5AsrModelState(ModelState):
 
         states: list[Nemotron3_5AsrDecodeState | None] = []
         for req_id in input_batch.req_ids:
+            streaming_state = self.streaming_states.get(req_id)
+            if streaming_state is not None:
+                states.append(streaming_state.decode_state)
+                continue
+
             state = self.decode_states.get(req_id)
             if state is None and req_id in self.audio_hashes:
                 audio_hash = self.audio_hashes[req_id]
@@ -122,6 +281,13 @@ class Nemotron3_5AsrModelState(ModelState):
             input_batch.num_computed_tokens_np + input_batch.num_scheduled_tokens
             >= input_batch.prefill_len_np
         )
+        for index, req_id in enumerate(input_batch.req_ids):
+            streaming_state = self.streaming_states.get(req_id)
+            if (
+                streaming_state is not None
+                and streaming_state.encoded_features < streaming_state.num_features
+            ):
+                ready[index] = False
         return {
             "decode_states": states,
             "query_end_positions": input_batch.query_start_loc_np[

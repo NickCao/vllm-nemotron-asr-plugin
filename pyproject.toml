@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest", "httpx", "soundfile", "librosa"]
 eval = ["huggingface-hub", "pyarrow", "jiwer", "soundfile"]
+mic = ["sounddevice>=0.5"]
 
 [project.entry-points."vllm.general_plugins"]
 nemotron_asr = "vllm_nemotron_asr_plugin:register"

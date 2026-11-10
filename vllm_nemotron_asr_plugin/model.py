@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NVIDIA Nemotron 3.5 ASR transcription."""
 
-from collections.abc import Iterable
+import asyncio
+from collections.abc import AsyncGenerator, Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -35,6 +38,7 @@ from vllm.inputs import (
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsRealtime,
     SupportsTranscription,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
@@ -84,6 +88,38 @@ class Nemotron3_5AsrAudioEncoder(nn.Module):
         if output_mask is not None:
             output_mask = output_mask.bool()
 
+        return self._project(hidden_states, prompt_ids), output_mask
+
+    def forward_streaming_chunk(
+        self,
+        input_features: torch.Tensor,
+        prompt_ids: torch.LongTensor | None,
+        num_lookahead_tokens: int,
+        past_key_values: object | None = None,
+        padding_cache: object | None = None,
+    ) -> tuple[torch.Tensor, object, object]:
+        """Encode one exact-size cache-aware chunk and return updated caches."""
+        encoder_outputs = self.encoder(
+            input_features=input_features,
+            attention_mask=None,
+            num_lookahead_tokens=num_lookahead_tokens,
+            past_key_values=past_key_values,
+            padding_cache=padding_cache,
+            use_cache=True,
+            output_attention_mask=False,
+        )
+        hidden_states = self._project(encoder_outputs.last_hidden_state, prompt_ids)
+        return (
+            hidden_states,
+            encoder_outputs.past_key_values,
+            encoder_outputs.padding_cache,
+        )
+
+    def _project(
+        self,
+        hidden_states: torch.Tensor,
+        prompt_ids: torch.LongTensor | None,
+    ) -> torch.Tensor:
         if prompt_ids is None:
             prompt_ids = torch.full(
                 (hidden_states.shape[0],),
@@ -100,7 +136,115 @@ class Nemotron3_5AsrAudioEncoder(nn.Module):
         hidden_states = self.prompt_projector(
             torch.cat((hidden_states, prompt), dim=-1)
         )
-        return self.encoder_projector(hidden_states), output_mask
+        return self.encoder_projector(hidden_states)
+
+
+class Nemotron3_5AsrRealtimeBuffer:
+    """Accumulate arbitrary PCM writes into exact cache-aware chunk sizes."""
+
+    def __init__(self, initial_capacity: int = 32_000) -> None:
+        self._buffer = np.empty(initial_capacity, dtype=np.float32)
+        self._filled = 0
+
+    def write(self, audio: np.ndarray) -> None:
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        end = self._filled + audio.size
+        if end > self._buffer.size:
+            new_buffer = np.empty(max(end, self._buffer.size * 2), dtype=np.float32)
+            new_buffer[: self._filled] = self._buffer[: self._filled]
+            self._buffer = new_buffer
+        self._buffer[self._filled : end] = audio
+        self._filled = end
+
+    def read(self, num_samples: int) -> np.ndarray | None:
+        if self._filled < num_samples:
+            return None
+        chunk = self._buffer[:num_samples].copy()
+        remaining = self._filled - num_samples
+        if remaining:
+            self._buffer[:remaining] = self._buffer[num_samples : self._filled]
+        self._filled = remaining
+        return chunk
+
+    def flush(self) -> np.ndarray | None:
+        if not self._filled:
+            return None
+        audio = self._buffer[: self._filled].copy()
+        self._filled = 0
+        return audio
+
+
+async def iter_realtime_chunks(
+    audio_stream: AsyncGenerator[np.ndarray, None],
+    *,
+    first_chunk_samples: int,
+    subsequent_chunk_samples: int,
+) -> AsyncGenerator[tuple[np.ndarray, bool, bool], None]:
+    """Split a live audio stream into cache-aware encoder chunks.
+
+    Yields ``(audio, is_first_audio_chunk, is_last_audio_chunk)``. One chunk of
+    lookahead is held back so the true final chunk can be marked as last.
+    """
+    buffer = Nemotron3_5AsrRealtimeBuffer()
+    audio_queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
+
+    async def fill_audio_buffer() -> None:
+        try:
+            async for audio in audio_stream:
+                audio_queue.put_nowait(audio)
+        finally:
+            audio_queue.put_nowait(None)
+
+    async def read_chunk(num_samples: int) -> np.ndarray | None:
+        while True:
+            chunk = buffer.read(num_samples)
+            if chunk is not None:
+                return chunk
+            audio = await audio_queue.get()
+            if audio is None:
+                return None
+            buffer.write(audio)
+
+    fill_task = asyncio.create_task(fill_audio_buffer())
+    try:
+        is_first_audio_chunk = True
+        pending: tuple[np.ndarray, bool] | None = None
+        while True:
+            required_samples = (
+                first_chunk_samples
+                if is_first_audio_chunk
+                else subsequent_chunk_samples
+            )
+            chunk = await read_chunk(required_samples)
+            if chunk is None:
+                break
+            if pending is not None:
+                yield pending[0], pending[1], False
+            pending = (chunk, is_first_audio_chunk)
+            is_first_audio_chunk = False
+
+        remaining = buffer.flush()
+        if remaining is not None:
+            if pending is not None:
+                yield pending[0], pending[1], False
+                pending = None
+            required_samples = (
+                first_chunk_samples
+                if is_first_audio_chunk
+                else subsequent_chunk_samples
+            )
+            if remaining.size < required_samples:
+                remaining = np.pad(
+                    remaining,
+                    (0, required_samples - remaining.size),
+                )
+            yield remaining, is_first_audio_chunk, True
+        elif pending is not None:
+            yield pending[0], pending[1], True
+    finally:
+        fill_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await fill_task
 
 
 @dataclass
@@ -197,8 +341,11 @@ def _decode_next_tokens(
     info=Nemotron3_5AsrProcessingInfo,
     dummy_inputs=Nemotron3_5AsrDummyInputsBuilder,
 )
-class Nemotron3_5AsrForRNNT(nn.Module, SupportsTranscription, SupportsMultiModal):
-    supports_transcription_only = True
+class Nemotron3_5AsrForRNNT(
+    nn.Module, SupportsTranscription, SupportsMultiModal, SupportsRealtime
+):
+    supports_transcription_only = False
+    realtime_max_tokens = 256
     supported_languages = {
         code: name
         for code, name in ISO639_1_SUPPORTED_LANGS.items()
@@ -251,6 +398,68 @@ class Nemotron3_5AsrForRNNT(nn.Module, SupportsTranscription, SupportsMultiModal
                 prompt_token_ids=[stt_params.model_config.hf_config.blank_token_id]
             ),
         )
+
+    @classmethod
+    async def buffer_realtime_audio(
+        cls,
+        audio_stream: AsyncGenerator[np.ndarray, None],
+        input_stream: asyncio.Queue[list[int]],
+        model_config: ModelConfig,
+    ) -> AsyncGenerator[PromptType, None]:
+        processor = MULTIMODAL_REGISTRY.create_processor(
+            model_config
+        ).info.get_hf_processor()
+        feature_extractor = processor.feature_extractor
+        sampling_rate = int(feature_extractor.sampling_rate)
+        first_chunk_samples = int(processor.num_samples_first_audio_chunk)
+        subsequent_chunk_samples = int(processor.num_samples_per_audio_chunk)
+        blank_token_id = model_config.hf_config.blank_token_id
+
+        def make_prompt(
+            audio: np.ndarray,
+            *,
+            is_first_audio_chunk: bool,
+            is_last_audio_chunk: bool = False,
+        ) -> PromptType:
+            return ExplicitEncoderDecoderPrompt(
+                encoder_prompt=TextPrompt(
+                    prompt="",
+                    multi_modal_data={"audio": audio},
+                    mm_processor_kwargs={
+                        "language": "auto",
+                        "sampling_rate": sampling_rate,
+                        "is_streaming": True,
+                        "is_first_audio_chunk": is_first_audio_chunk,
+                        "audio_kwargs": {
+                            "is_last_audio_chunk": is_last_audio_chunk,
+                        },
+                    },
+                ),
+                decoder_prompt=TokensPrompt(
+                    prompt_token_ids=[blank_token_id],
+                ),
+            )
+
+        async def drain_output_tokens() -> None:
+            while True:
+                await input_stream.get()
+
+        drain_task = asyncio.create_task(drain_output_tokens())
+        try:
+            async for audio, is_first, is_last in iter_realtime_chunks(
+                audio_stream,
+                first_chunk_samples=first_chunk_samples,
+                subsequent_chunk_samples=subsequent_chunk_samples,
+            ):
+                yield make_prompt(
+                    audio,
+                    is_first_audio_chunk=is_first,
+                    is_last_audio_chunk=is_last,
+                )
+        finally:
+            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
