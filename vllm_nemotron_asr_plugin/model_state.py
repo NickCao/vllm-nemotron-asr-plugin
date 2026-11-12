@@ -4,9 +4,6 @@
 from typing import Any
 
 import torch
-from transformers.models.nemotron3_5_asr.generation_nemotron3_5_asr import (
-    Nemotron3_5AsrRNNTDecoderCache,
-)
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -19,7 +16,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
-from .model import Nemotron3_5AsrDecodeState
+from .model import Nemotron3_5AsrDecodeState, decoder_cache_cls
 
 
 class Nemotron3_5AsrStreamingState:
@@ -43,7 +40,7 @@ class Nemotron3_5AsrStreamingState:
         )
         self.decode_state = Nemotron3_5AsrDecodeState(
             encoder_frames=self.frame_buffer[:0],
-            decoder_cache=Nemotron3_5AsrRNNTDecoderCache(config),
+            decoder_cache=decoder_cache_cls(config)(config),
             last_token_id=config.blank_token_id,
         )
         self.past_key_values: object | None = None
@@ -129,7 +126,7 @@ class Nemotron3_5AsrModelState(ModelState):
             return
 
         if len(audio_features) != 1:
-            raise ValueError("Nemotron 3.5 ASR expects one audio per request.")
+            raise ValueError("Nemotron ASR expects one audio per request.")
         self.audio_hashes[new_req_data.req_id] = audio_features[0].identifier
         self.request_indices[new_req_data.req_id] = req_index
         assert new_req_data.prefill_token_ids is not None
@@ -186,7 +183,8 @@ class Nemotron3_5AsrModelState(ModelState):
                 f"request {req_id} is no longer available."
             )
         input_features = feature.data["input_features"].data
-        prompt_ids = feature.data["prompt_ids"].data
+        prompt_ids_elem = feature.data.get("prompt_ids")
+        prompt_ids = None if prompt_ids_elem is None else prompt_ids_elem.data
         lookahead = feature.data["num_lookahead_tokens"].data
         assert isinstance(input_features, torch.Tensor)
         if input_features.ndim == 2:
@@ -270,7 +268,9 @@ class Nemotron3_5AsrModelState(ModelState):
                 frames.copy_(encoder_frames)
                 state = Nemotron3_5AsrDecodeState(
                     encoder_frames=frames,
-                    decoder_cache=Nemotron3_5AsrRNNTDecoderCache(self.model.config),
+                    decoder_cache=decoder_cache_cls(self.model.config)(
+                        self.model.config
+                    ),
                     last_token_id=self.model.config.blank_token_id,
                     num_tokens_to_replay=self.num_tokens_to_replay.pop(req_id),
                 )
@@ -306,7 +306,9 @@ class Nemotron3_5AsrModelState(ModelState):
             "decode_states": [
                 Nemotron3_5AsrDecodeState(
                     encoder_frames=frames,
-                    decoder_cache=Nemotron3_5AsrRNNTDecoderCache(self.model.config),
+                    decoder_cache=decoder_cache_cls(self.model.config)(
+                        self.model.config
+                    ),
                     last_token_id=self.model.config.blank_token_id,
                 )
                 for _ in range(num_reqs)

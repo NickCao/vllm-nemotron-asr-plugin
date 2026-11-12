@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""NVIDIA Nemotron 3.5 ASR transcription."""
+"""NVIDIA Nemotron ASR transcription.
+
+Supports the multilingual ``nvidia/nemotron-3.5-asr-streaming-0.6b`` checkpoint
+(language-prompt conditioning) and the English
+``nvidia/nemotron-speech-streaming-en-0.6b`` checkpoint (no prompt
+conditioning). Both share the cache-aware FastConformer encoder and the LSTM
+RNN-T decoder/joint implementation from Transformers.
+"""
 
 import asyncio
 from collections.abc import AsyncGenerator, Iterable
@@ -14,6 +21,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import (
     Nemotron3_5AsrConfig,
+    NemotronAsrStreamingConfig,
     NemotronAsrStreamingEncoder,
 )
 from transformers.models.nemotron3_5_asr.generation_nemotron3_5_asr import (
@@ -26,6 +34,13 @@ from transformers.models.nemotron3_5_asr.modeling_nemotron3_5_asr import (
 )
 from transformers.models.nemotron3_5_asr.processing_nemotron3_5_asr import (
     DEFAULT_PROMPT_DICTIONARY,
+)
+from transformers.models.nemotron_asr_streaming.generation_nemotron_asr_streaming import (  # noqa: E501
+    NemotronAsrStreamingRNNTDecoderCache,
+)
+from transformers.models.nemotron_asr_streaming.modeling_nemotron_asr_streaming import (
+    NemotronAsrStreamingRNNTDecoder,
+    NemotronAsrStreamingRNNTJointNetwork,
 )
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.speech_to_text import SpeechToTextParams
@@ -57,10 +72,49 @@ if TYPE_CHECKING:
     )
 
 
-class Nemotron3_5AsrAudioEncoder(nn.Module):
-    """Encode mel features and apply language-prompt conditioning."""
+NemotronAsrConfig = Nemotron3_5AsrConfig | NemotronAsrStreamingConfig
+NemotronAsrRNNTDecoder = Nemotron3_5AsrRNNTDecoder | NemotronAsrStreamingRNNTDecoder
+NemotronAsrRNNTJointNetwork = (
+    Nemotron3_5AsrRNNTJointNetwork | NemotronAsrStreamingRNNTJointNetwork
+)
+NemotronAsrRNNTDecoderCache = (
+    Nemotron3_5AsrRNNTDecoderCache | NemotronAsrStreamingRNNTDecoderCache
+)
 
-    def __init__(self, config: Nemotron3_5AsrConfig):
+
+def supports_prompt_conditioning(config: object) -> bool:
+    """Whether the checkpoint fuses a language-prompt one-hot into the encoder."""
+    return getattr(config, "num_prompts", None) is not None
+
+
+def decoder_cache_cls(config: object) -> type:
+    if isinstance(config, Nemotron3_5AsrConfig):
+        return Nemotron3_5AsrRNNTDecoderCache
+    if isinstance(config, NemotronAsrStreamingConfig):
+        return NemotronAsrStreamingRNNTDecoderCache
+    raise TypeError(f"Unsupported Nemotron ASR config: {type(config).__name__}")
+
+
+def rnnt_decoder_cls(config: object) -> type:
+    if isinstance(config, Nemotron3_5AsrConfig):
+        return Nemotron3_5AsrRNNTDecoder
+    if isinstance(config, NemotronAsrStreamingConfig):
+        return NemotronAsrStreamingRNNTDecoder
+    raise TypeError(f"Unsupported Nemotron ASR config: {type(config).__name__}")
+
+
+def rnnt_joint_cls(config: object) -> type:
+    if isinstance(config, Nemotron3_5AsrConfig):
+        return Nemotron3_5AsrRNNTJointNetwork
+    if isinstance(config, NemotronAsrStreamingConfig):
+        return NemotronAsrStreamingRNNTJointNetwork
+    raise TypeError(f"Unsupported Nemotron ASR config: {type(config).__name__}")
+
+
+class Nemotron3_5AsrAudioEncoder(nn.Module):
+    """Encode mel features, applying language-prompt conditioning when present."""
+
+    def __init__(self, config: NemotronAsrConfig):
         super().__init__()
         self.config = config
         self.encoder = NemotronAsrStreamingEncoder(config.encoder_config)
@@ -68,7 +122,11 @@ class Nemotron3_5AsrAudioEncoder(nn.Module):
             config.encoder_config.hidden_size,
             config.decoder_hidden_size,
         )
-        self.prompt_projector = Nemotron3_5AsrPromptProjector(config)
+        self.prompt_projector = (
+            Nemotron3_5AsrPromptProjector(config)
+            if supports_prompt_conditioning(config)
+            else None
+        )
 
     def forward(
         self,
@@ -120,6 +178,8 @@ class Nemotron3_5AsrAudioEncoder(nn.Module):
         hidden_states: torch.Tensor,
         prompt_ids: torch.LongTensor | None,
     ) -> torch.Tensor:
+        if self.prompt_projector is None:
+            return self.encoder_projector(hidden_states)
         if prompt_ids is None:
             prompt_ids = torch.full(
                 (hidden_states.shape[0],),
@@ -244,7 +304,7 @@ async def iter_realtime_chunks(
 @dataclass
 class Nemotron3_5AsrDecodeState:
     encoder_frames: torch.Tensor
-    decoder_cache: Nemotron3_5AsrRNNTDecoderCache
+    decoder_cache: NemotronAsrRNNTDecoderCache
     last_token_id: int
     frame_idx: int = 0
     symbols_at_frame: int = 0
@@ -253,8 +313,8 @@ class Nemotron3_5AsrDecodeState:
 
 def _decode_next_tokens(
     states: list[Nemotron3_5AsrDecodeState],
-    decoder: Nemotron3_5AsrRNNTDecoder,
-    joint: Nemotron3_5AsrRNNTJointNetwork,
+    decoder: NemotronAsrRNNTDecoder,
+    joint: NemotronAsrRNNTJointNetwork,
     *,
     blank_token_id: int,
     max_symbols_per_step: int,
@@ -283,7 +343,7 @@ def _decode_next_tokens(
         for initialized, group in zip((False, True), groups):
             if not group:
                 continue
-            cache = Nemotron3_5AsrRNNTDecoderCache(group[0].decoder_cache.config)
+            cache = type(group[0].decoder_cache)(group[0].decoder_cache.config)
             if initialized:
                 cache.cache = torch.cat([s.decoder_cache.cache for s in group])
                 cache.hidden_state = torch.cat(
@@ -376,17 +436,25 @@ class Nemotron3_5AsrForRNNT(
     @classmethod
     def get_generation_prompt(cls, stt_params: SpeechToTextParams) -> PromptType:
         if stt_params.task_type != "transcribe":
-            raise ValueError("Nemotron 3.5 ASR supports transcription only.")
+            raise ValueError("Nemotron ASR supports transcription only.")
         if stt_params.request_prompt or stt_params.hotwords or stt_params.to_language:
             raise ValueError("Text prompts, hotwords and translation are unsupported.")
         language = stt_params.language or "auto"
+        if supports_prompt_conditioning(stt_params.model_config.hf_config):
+            mm_processor_kwargs: dict[str, object] = {"language": language}
+        else:
+            if language != "auto" and not language.lower().startswith("en"):
+                raise ValueError(
+                    "Nemotron ASR Streaming supports English transcription only."
+                )
+            mm_processor_kwargs = {}
         return ExplicitEncoderDecoderPrompt(
             encoder_prompt=TextPrompt(
                 prompt="",
                 multi_modal_data={
                     "audio": (stt_params.audio, stt_params.stt_config.sample_rate)
                 },
-                mm_processor_kwargs={"language": language},
+                mm_processor_kwargs=mm_processor_kwargs,
             ),
             decoder_prompt=TokensPrompt(
                 prompt_token_ids=[stt_params.model_config.hf_config.blank_token_id]
@@ -408,6 +476,7 @@ class Nemotron3_5AsrForRNNT(
         first_chunk_samples = int(processor.num_samples_first_audio_chunk)
         subsequent_chunk_samples = int(processor.num_samples_per_audio_chunk)
         blank_token_id = model_config.hf_config.blank_token_id
+        prompt_conditioning = supports_prompt_conditioning(model_config.hf_config)
 
         def make_prompt(
             audio: np.ndarray,
@@ -415,19 +484,21 @@ class Nemotron3_5AsrForRNNT(
             is_first_audio_chunk: bool,
             is_last_audio_chunk: bool = False,
         ) -> PromptType:
+            mm_processor_kwargs: dict[str, object] = {
+                "sampling_rate": sampling_rate,
+                "is_streaming": True,
+                "is_first_audio_chunk": is_first_audio_chunk,
+                "audio_kwargs": {
+                    "is_last_audio_chunk": is_last_audio_chunk,
+                },
+            }
+            if prompt_conditioning:
+                mm_processor_kwargs["language"] = "auto"
             return ExplicitEncoderDecoderPrompt(
                 encoder_prompt=TextPrompt(
                     prompt="",
                     multi_modal_data={"audio": audio},
-                    mm_processor_kwargs={
-                        "language": "auto",
-                        "sampling_rate": sampling_rate,
-                        "is_streaming": True,
-                        "is_first_audio_chunk": is_first_audio_chunk,
-                        "audio_kwargs": {
-                            "is_last_audio_chunk": is_last_audio_chunk,
-                        },
-                    },
+                    mm_processor_kwargs=mm_processor_kwargs,
                 ),
                 decoder_prompt=TokensPrompt(
                     prompt_token_ids=[blank_token_id],
@@ -457,10 +528,10 @@ class Nemotron3_5AsrForRNNT(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        self.config: Nemotron3_5AsrConfig = vllm_config.model_config.hf_config
+        self.config: NemotronAsrConfig = vllm_config.model_config.hf_config
         self.audio_encoder = Nemotron3_5AsrAudioEncoder(self.config)
-        self.decoder = Nemotron3_5AsrRNNTDecoder(self.config)
-        self.joint = Nemotron3_5AsrRNNTJointNetwork(self.config)
+        self.decoder = rnnt_decoder_cls(self.config)(self.config)
+        self.joint = rnnt_joint_cls(self.config)(self.config)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         input_features = cast(
@@ -548,3 +619,9 @@ class Nemotron3_5AsrForRNNT(
         return AutoWeightsLoader(self).load_weights(
             weights, mapper=self.hf_to_vllm_mapper
         )
+
+
+class NemotronAsrStreamingForRNNT(Nemotron3_5AsrForRNNT):
+    """English Nemotron ASR Streaming checkpoint (no prompt conditioning)."""
+
+    supported_languages = {"en": "English"}

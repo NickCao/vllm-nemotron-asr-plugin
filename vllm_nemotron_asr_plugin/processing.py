@@ -14,6 +14,8 @@ from transformers import (
     BatchFeature,
     Nemotron3_5AsrConfig,
     Nemotron3_5AsrProcessor,
+    NemotronAsrStreamingConfig,
+    NemotronAsrStreamingProcessor,
 )
 from transformers.audio_utils import mel_filter_bank
 from transformers.feature_extraction_sequence_utils import SequenceFeatureExtractor
@@ -318,10 +320,14 @@ class Nemotron3_5AsrProcessingInfo(BaseProcessingInfo):
     def get_default_tok_params(self) -> TokenizeParams:
         return super().get_default_tok_params().with_kwargs(add_special_tokens=False)
 
-    def get_hf_config(self) -> Nemotron3_5AsrConfig:
-        return self.ctx.get_hf_config(Nemotron3_5AsrConfig)
+    def get_hf_config(self) -> Nemotron3_5AsrConfig | NemotronAsrStreamingConfig:
+        return self.ctx.get_hf_config(
+            (Nemotron3_5AsrConfig, NemotronAsrStreamingConfig)
+        )
 
-    def get_hf_processor(self, **kwargs: object) -> Nemotron3_5AsrProcessor:
+    def get_hf_processor(
+        self, **kwargs: object
+    ) -> Nemotron3_5AsrProcessor | NemotronAsrStreamingProcessor:
         del kwargs
         if not hasattr(self, "_cached_hf_processor"):
             revision = self.ctx.model_config.revision
@@ -339,12 +345,29 @@ class Nemotron3_5AsrProcessingInfo(BaseProcessingInfo):
             feature_config.pop("feature_extractor_type", None)
             processor_config.pop("processor_class", None)
             feature_extractor = NemotronAsrStreamingFeatureExtractor(**feature_config)
-            self._cached_hf_processor = Nemotron3_5AsrProcessor(
+            processor_cls = (
+                Nemotron3_5AsrProcessor
+                if isinstance(self.get_hf_config(), Nemotron3_5AsrConfig)
+                else NemotronAsrStreamingProcessor
+            )
+            processor = processor_cls(
                 feature_extractor,
                 self.get_tokenizer(),
                 **processor_config,
             )
+            lookahead = self._configured_lookahead()
+            if lookahead is not None:
+                # Also resizes the streaming chunks: 0 -> 80 ms, 3 -> 320 ms,
+                # 6 -> 560 ms, 13 -> 1120 ms of encoder context per step.
+                processor.set_num_lookahead_tokens(lookahead)
+            self._cached_hf_processor = processor
         return self._cached_hf_processor
+
+    def _configured_lookahead(self) -> int | None:
+        multimodal_config = self.ctx.model_config.multimodal_config
+        mm_kwargs = getattr(multimodal_config, "mm_processor_kwargs", None) or {}
+        lookahead = mm_kwargs.get("num_lookahead_tokens")
+        return None if lookahead is None else int(lookahead)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": 1}
@@ -434,6 +457,13 @@ class Nemotron3_5AsrMultiModalProcessor(
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> HFMultiModalInputs:
+        # Applied to the processor in ``get_hf_processor``; forwarding it would
+        # reach the feature extractor and be rejected.
+        hf_processor_mm_kwargs = {
+            key: value
+            for key, value in hf_processor_mm_kwargs.items()
+            if key != "num_lookahead_tokens"
+        }
         is_streaming = bool(hf_processor_mm_kwargs.get("is_streaming", False))
         is_first_audio_chunk = bool(
             hf_processor_mm_kwargs.get("is_first_audio_chunk", True)
@@ -464,16 +494,12 @@ class Nemotron3_5AsrMultiModalProcessor(
                 )
                 if audio_length != expected_length:
                     raise ValueError(
-                        "Nemotron 3.5 ASR streaming chunks must contain exactly "
+                        "Nemotron ASR streaming chunks must contain exactly "
                         f"{expected_length} audio samples, got {audio_length}."
                     )
-            if (
-                not feature_extractor.hop_length
-                <= audio_length
-                <= max_samples
-            ):
+            if not feature_extractor.hop_length <= audio_length <= max_samples:
                 raise ValueError(
-                    "Nemotron 3.5 ASR expects between "
+                    "Nemotron ASR expects between "
                     f"{feature_extractor.hop_length} and {max_samples} audio samples "
                     f"at {feature_extractor.sampling_rate} Hz."
                 )
@@ -515,10 +541,9 @@ class Nemotron3_5AsrMultiModalProcessor(
         if hf_inputs["input_features"].shape[1] > max_mel_frames:
             raise ValueError("Padded audio exceeds the profiled Nemotron audio length.")
         num_audios = hf_inputs["input_features"].shape[0]
-        return {
+        fields = {
             "input_features": MultiModalFieldConfig.batched("audio"),
             "attention_mask": MultiModalFieldConfig.batched("audio"),
-            "prompt_ids": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
             "num_lookahead_tokens": MultiModalFieldConfig.shared(
                 "audio", num_audios, keep_on_cpu=True
             ),
@@ -529,6 +554,11 @@ class Nemotron3_5AsrMultiModalProcessor(
                 "audio", num_audios, keep_on_cpu=True
             ),
         }
+        if "prompt_ids" in hf_inputs:
+            fields["prompt_ids"] = MultiModalFieldConfig.batched(
+                "audio", keep_on_cpu=True
+            )
+        return fields
 
     def _get_prompt_updates(
         self,
@@ -580,3 +610,7 @@ class Nemotron3_5AsrRenderer(HfRenderer):
         # Acoustic blanks are consumed inside the RNNT loop. The model only
         # exposes blank to the engine once all encoder frames are exhausted.
         return self.model_config.hf_config.blank_token_id
+
+
+class NemotronAsrStreamingRenderer(Nemotron3_5AsrRenderer):
+    """Renderer for the English checkpoint; identical token boundaries."""

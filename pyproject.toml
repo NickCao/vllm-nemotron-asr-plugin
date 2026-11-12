@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-nemotron-asr-plugin"
 version = "0.1.0"
-description = "Nemotron 3.5 ASR complete-audio transcription for vLLM"
+description = "Nemotron ASR transcription and realtime streaming for vLLM"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"

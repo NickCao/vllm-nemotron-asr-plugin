@@ -4,6 +4,7 @@
 import argparse
 import os
 
+from transformers import AutoConfig
 from vllm import LLM, SamplingParams
 from vllm.assets.audio import AudioAsset
 from vllm.multimodal.media.audio import load_audio
@@ -14,6 +15,11 @@ def main() -> None:
     parser.add_argument(
         "audio", nargs="?", help="Audio file; defaults to a speech sample"
     )
+    parser.add_argument(
+        "--model",
+        default="nvidia/nemotron-3.5-asr-streaming-0.6b",
+        help="Nemotron ASR checkpoint to load",
+    )
     parser.add_argument("--language", default="en")
     args = parser.parse_args()
     audio = (
@@ -23,19 +29,21 @@ def main() -> None:
     )
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
     llm = LLM(
-        model="nvidia/nemotron-3.5-asr-streaming-0.6b",
+        model=args.model,
         enforce_eager=True,
         dtype="float16",
         max_model_len=512,
         max_num_seqs=4,
         gpu_memory_utilization=0.5,
     )
+    prompt = {
+        "prompt": "",
+        "multi_modal_data": {"audio": audio},
+    }
+    if AutoConfig.from_pretrained(args.model).model_type == "nemotron3_5_asr":
+        prompt["mm_processor_kwargs"] = {"language": args.language}
     output = llm.generate(
-        {
-            "prompt": "",
-            "multi_modal_data": {"audio": audio},
-            "mm_processor_kwargs": {"language": args.language},
-        },
+        prompt,
         SamplingParams(temperature=0, max_tokens=511),
         use_tqdm=False,
     )

@@ -1,8 +1,16 @@
-# Nemotron 3.5 ASR Plugin for vLLM
+# Nemotron ASR Plugin for vLLM
 
-Out-of-tree vLLM model plugin for complete-audio and cache-aware realtime transcription with [`nvidia/nemotron-3.5-asr-streaming-0.6b`](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b).
+Out-of-tree vLLM model plugin for complete-audio and cache-aware realtime transcription with:
 
-The plugin integrates `Nemotron3_5AsrForRNNT` with vLLM using batched greedy RNN-T decoding and the standard OpenAI-compatible `/v1/audio/transcriptions` endpoint.
+- [`nvidia/nemotron-3.5-asr-streaming-0.6b`](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
+  (`Nemotron3_5AsrForRNNT`, multilingual with language-prompt conditioning)
+- [`nvidia/nemotron-speech-streaming-en-0.6b`](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b)
+  (`NemotronAsrStreamingForRNNT`, English without prompt conditioning)
+
+Both checkpoints share the cache-aware FastConformer encoder and the LSTM
+RNN-T decoder. The plugin integrates them with vLLM using batched greedy RNN-T
+decoding and the standard OpenAI-compatible `/v1/audio/transcriptions`
+endpoint.
 
 Realtime transcription runs one resumable vLLM request per WebSocket session and streams transcript deltas over `/v1/realtime`. It requires Model Runner V2, eager execution, CUDA, TP=PP=1, and the core scheduler patch described in [`patches/README.md`](patches/README.md) until equivalent support lands upstream.
 
@@ -54,13 +62,14 @@ export VLLM_PLUGINS=nemotron_asr
 
 ## Verify Installation
 
-After installation, verify that vLLM discovers the plugin and registers `Nemotron3_5AsrForRNNT`:
+After installation, verify that vLLM discovers the plugin and registers
+`Nemotron3_5AsrForRNNT` and `NemotronAsrStreamingForRNNT`:
 
 ```bash
 python verify_plugin.py
 ```
 
-A successful check confirms that the installed entry point is available and the Nemotron ASR model is registered with vLLM.
+A successful check confirms that the installed entry point is available and both Nemotron ASR architectures are registered with vLLM.
 
 ## Usage
 
@@ -85,6 +94,17 @@ Start vLLM:
 ```bash
 VLLM_USE_V2_MODEL_RUNNER=1 \
 vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
+    --enforce-eager \
+    --dtype float16 \
+    --max-num-seqs 4 \
+    --gpu-memory-utilization 0.5
+```
+
+The English checkpoint is served the same way:
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 \
+vllm serve nvidia/nemotron-speech-streaming-en-0.6b \
     --enforce-eager \
     --dtype float16 \
     --max-num-seqs 4 \
@@ -182,6 +202,7 @@ See [`scripts/README.md`](scripts/README.md) for evaluation details.
 ## Supported Configuration
 
 - `nvidia/nemotron-3.5-asr-streaming-0.6b`
+- `nvidia/nemotron-speech-streaming-en-0.6b`
 - complete-audio transcription
 - cache-aware realtime transcription over `/v1/realtime`
 - Model Runner V2
@@ -206,6 +227,7 @@ The following are currently unsupported:
 - tensor or pipeline parallelism
 - translation
 - text prompts and hotwords
+- language selection beyond English on `nemotron-speech-streaming-en-0.6b`
 - structured outputs
 - confidence scoring
 

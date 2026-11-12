@@ -43,9 +43,16 @@ def check_model_class() -> bool:
     """Check if the Nemotron model class can be imported."""
     print("\nChecking Nemotron model class...")
     try:
-        from vllm_nemotron_asr_plugin.model import Nemotron3_5AsrForRNNT
+        from vllm_nemotron_asr_plugin.model import (
+            Nemotron3_5AsrForRNNT,
+            NemotronAsrStreamingForRNNT,
+        )
 
-        print(f"✓ {Nemotron3_5AsrForRNNT.__name__} class imported successfully")
+        print(
+            "✓ Model classes imported successfully: "
+            f"{Nemotron3_5AsrForRNNT.__name__}, "
+            f"{NemotronAsrStreamingForRNNT.__name__}"
+        )
         return True
     except ImportError as exc:
         print(f"✗ Cannot import Nemotron model class: {exc}")
@@ -79,15 +86,25 @@ def test_model_registration() -> bool:
         from vllm import ModelRegistry, envs
         from vllm.plugins import load_general_plugins
 
-        from vllm_nemotron_asr_plugin.model import Nemotron3_5AsrForRNNT
+        from vllm_nemotron_asr_plugin.model import (
+            Nemotron3_5AsrForRNNT,
+            NemotronAsrStreamingForRNNT,
+        )
 
         if envs.VLLM_PLUGINS is not None and "nemotron_asr" not in envs.VLLM_PLUGINS:
             raise RuntimeError("VLLM_PLUGINS must include nemotron_asr or be unset.")
         load_general_plugins()
-        model_cls = ModelRegistry.models["Nemotron3_5AsrForRNNT"].load_model_cls()
-        if model_cls is not Nemotron3_5AsrForRNNT:
-            raise RuntimeError("ModelRegistry did not resolve the plugin model class.")
-        print(f"✓ Model registered successfully: {model_cls}")
+        expected = {
+            "Nemotron3_5AsrForRNNT": Nemotron3_5AsrForRNNT,
+            "NemotronAsrStreamingForRNNT": NemotronAsrStreamingForRNNT,
+        }
+        for arch, expected_cls in expected.items():
+            model_cls = ModelRegistry.models[arch].load_model_cls()
+            if model_cls is not expected_cls:
+                raise RuntimeError(
+                    f"ModelRegistry did not resolve {arch} to the plugin model class."
+                )
+        print(f"✓ Models registered successfully: {', '.join(expected)}")
         return True
     except Exception as exc:
         print(f"✗ Model registration failed: {exc}")

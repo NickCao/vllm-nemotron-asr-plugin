@@ -9,9 +9,23 @@ import openai
 import pytest
 import soundfile as sf
 import torch
-from transformers import AutoConfig, AutoProcessor, Nemotron3_5AsrForRNNT
+from transformers import (
+    AutoConfig,
+    AutoProcessor,
+    Nemotron3_5AsrForRNNT,
+    NemotronAsrStreamingForRNNT,
+)
 
 MODEL = "nvidia/nemotron-3.5-asr-streaming-0.6b"
+ENGLISH_MODEL = "nvidia/nemotron-speech-streaming-en-0.6b"
+
+
+def _audio_file(seconds: float) -> io.BytesIO:
+    buffer = io.BytesIO()
+    sf.write(buffer, np.zeros(int(16_000 * seconds)), 16_000, format="WAV")
+    buffer.name = "speech.wav"
+    buffer.seek(0)
+    return buffer
 
 
 @pytest.mark.gpu
@@ -61,21 +75,14 @@ def test_nemotron_transcription_and_request_isolation(tmp_path, run_server):
         )
     assert expected[1.0] != expected[0.5]
 
-    def audio_file(seconds: float) -> io.BytesIO:
-        buffer = io.BytesIO()
-        sf.write(buffer, np.zeros(int(16_000 * seconds)), 16_000, format="WAV")
-        buffer.name = "speech.wav"
-        buffer.seek(0)
-        return buffer
-
     async def run_requests(base_url: str) -> None:
         async with openai.AsyncOpenAI(base_url=base_url, api_key="unused") as client:
             longer, shorter = await asyncio.gather(
                 client.audio.transcriptions.create(
-                    model=str(tmp_path), file=audio_file(1.0), language="en"
+                    model=str(tmp_path), file=_audio_file(1.0), language="en"
                 ),
                 client.audio.transcriptions.create(
-                    model=str(tmp_path), file=audio_file(0.5), language="en"
+                    model=str(tmp_path), file=_audio_file(0.5), language="en"
                 ),
             )
             assert longer.text == expected[1.0]
@@ -83,18 +90,18 @@ def test_nemotron_transcription_and_request_isolation(tmp_path, run_server):
 
             with pytest.raises(openai.BadRequestError):
                 await client.audio.translations.create(
-                    model=str(tmp_path), file=audio_file(0.5)
+                    model=str(tmp_path), file=_audio_file(0.5)
                 )
 
             with pytest.raises(openai.BadRequestError):
                 await client.audio.transcriptions.create(
-                    model=str(tmp_path), file=audio_file(0.5), language="invalid"
+                    model=str(tmp_path), file=_audio_file(0.5), language="invalid"
                 )
 
             with pytest.raises(openai.BadRequestError, match="max allowed: 0"):
                 await client.audio.transcriptions.create(
                     model=str(tmp_path),
-                    file=audio_file(0.5),
+                    file=_audio_file(0.5),
                     extra_body={"use_beam_search": True},
                 )
 
@@ -108,6 +115,77 @@ def test_nemotron_transcription_and_request_isolation(tmp_path, run_server):
             "512",
             "--gpu-memory-utilization",
             "0.5",
+        ],
+    ) as server:
+        asyncio.run(run_requests(server))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required for serving"
+)
+def test_english_transcription(tmp_path, run_server):
+    config = AutoConfig.from_pretrained(ENGLISH_MODEL)
+    config.encoder_config.hidden_size = 16
+    config.encoder_config.intermediate_size = 32
+    config.encoder_config.num_hidden_layers = 1
+    config.encoder_config.num_attention_heads = 4
+    config.encoder_config.num_key_value_heads = 4
+    config.encoder_config.subsampling_conv_channels = 4
+    config.encoder_config.max_position_embeddings = 512
+    config.decoder_hidden_size = 8
+    config.max_symbols_per_step = 2
+
+    processor = AutoProcessor.from_pretrained(ENGLISH_MODEL)
+    token_id = processor.tokenizer.encode("hello", add_special_tokens=False)[0]
+    model = NemotronAsrStreamingForRNNT(config).eval()
+    with torch.no_grad():
+        model.joint.head.weight.zero_()
+        model.joint.head.bias.fill_(-10)
+        model.joint.head.bias[token_id] = 10
+    model.save_pretrained(tmp_path)
+    processor.save_pretrained(tmp_path)
+
+    inputs = processor(
+        np.zeros(16_000, dtype=np.float32),
+        sampling_rate=16_000,
+        return_tensors="pt",
+    )
+    inputs.pop("num_lookahead_tokens")
+    with torch.inference_mode():
+        output = model.generate(
+            **inputs,
+            decoder_start_token_id=config.blank_token_id,
+            max_new_tokens=64,
+        )
+    expected = processor.decode(output.sequences[0], skip_special_tokens=True)
+
+    async def run_requests(base_url: str) -> None:
+        async with openai.AsyncOpenAI(base_url=base_url, api_key="unused") as client:
+            transcription = await client.audio.transcriptions.create(
+                model=str(tmp_path),
+                file=_audio_file(1.0),
+                language="en",
+            )
+            assert transcription.text == expected
+
+            with pytest.raises(openai.BadRequestError, match="English"):
+                await client.audio.transcriptions.create(
+                    model=str(tmp_path),
+                    file=_audio_file(1.0),
+                    language="de",
+                )
+
+    with run_server(
+        str(tmp_path),
+        [
+            "--enforce-eager",
+            "--dtype",
+            "float16",
+            "--max-model-len",
+            "512",
+            "--gpu-memory-utilization",
+            "0.3",
         ],
     ) as server:
         asyncio.run(run_requests(server))
