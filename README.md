@@ -234,6 +234,13 @@ The following are currently unsupported:
 Realtime session recovery across preemption or worker restarts is still
 pilot-grade and should not be relied on in production.
 
+Realtime streaming also inherits two scheduler-level limitations from the
+required core patch: encoder-cache accounting still follows upstream's
+single-input model, so the budget over-counts free slots instead of
+enforcing them, and the per-request encoder feature list grows with session
+length. Sessions are not stopped at `--max-model-len`. See
+[`patches/README.md`](patches/README.md#limitations).
+
 Selected-token logprobs exposed by the current implementation are synthetic and are not model probabilities.
 
 ## License
